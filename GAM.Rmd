@@ -1,0 +1,1407 @@
+---
+title: "NICAP sMRI - LME"
+author: "Nandi"
+date: "14 Mar 2019"
+output: html_document
+---
+
+###LOAD PACKAGES AND SET DIRECTORIES
+```{r, include=FALSE}
+packages <- c("zoo", "tidyr", "tibble","stringr","dplyr","ggplot2","parallel","lme4","data.table","foreign","VIM","mice","mgcv","itsadug","gratia","rowr","gridExtra","viridis")
+if (length(setdiff(packages, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(packages, rownames(installed.packages())))  
+}
+lapply(packages, library, character.only = TRUE)
+
+getmode <- function(v) {
+   uniqv <- unique(v)
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+numcores <- detectCores()
+scaleFUN <- function(x) sprintf("%.0f", x)
+
+select <- dplyr::select
+
+nicap_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/sMRI/freesurfer_hires/parcellations/'
+icats_dir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/sMRI/freesurfer_hires_iCATS/parcellations/'
+
+datadir <- '/Volumes/rds/RDS27534-NICAP/behaviour/'
+outdir <- '/Volumes/rds/RDS27534-NICAP/bids/derivatives/nandi/sMRI/gam/'
+```
+
+###IMPORT BRAIN
+```{r}
+#check that 2 brain datasets have same variable lists, then rbind together
+nicap_brain <- read.csv(paste0(datadir,"demo_icats_nicap/nicap_controls.csv"), header = T)
+icats_brain <- read.csv(paste0(datadir,"demo_icats_nicap/icats.csv"), header = T)
+
+nicap_brain <- nicap_brain %>% gather(variable,value,-SID,-wave)
+icats_brain <- icats_brain %>% gather(variable,value,-SID,-wave)
+
+brain <- icats_brain %>% mutate(SID = as.character(SID)) %>% rbind(nicap_brain) %>%
+  mutate(id = paste0(SID,'_',wave)) %>% mutate(SID = as.factor(SID), wave=as.factor(wave))
+
+brain_wide <- brain %>% spread(variable,value)
+```
+
+###IMPORT SUBJECT LIST
+```{r}
+demo <- read.csv(paste0(datadir,'demo_icats_nicap/list_icats_nicap.csv'),header=T)
+```
+
+###IMPORT ICATS DEMO & IMPUTE
+```{r}
+#import data and impute
+icats_demo = read.spss(paste0(datadir,'iCATS/iCATS_db.sav'), to.data.frame=TRUE)
+
+icats_demo <- icats_demo %>% 
+  select(CATS_ID,C_Gender,Age_years_RCH_1,Age_years_RCH_2,
+         DHEA_W1_ave_trans_1, DHEAS_W1_FRCrctd_ave_trans_1, TST_W1_ave_trans_1,
+         DHEA_W2_mean_transf, DHEAS_W2_mean_corrected_transf, TST_W2_mean_transf) %>%
+  dplyr::rename(SID = CATS_ID,
+         gender = C_Gender,
+         age_wave1 = Age_years_RCH_1,
+         age_wave2 = Age_years_RCH_2,
+         dhea_wave1 = DHEA_W1_ave_trans_1,
+         dhea_wave2 = DHEAS_W1_FRCrctd_ave_trans_1,
+         dheaS_wave1 = DHEA_W2_mean_transf,
+         dheaS_wave2 = DHEAS_W2_mean_corrected_transf,
+         test_wave1 = TST_W1_ave_trans_1,
+         test_wave2 = TST_W2_mean_transf)
+
+icats_demo2 = read.csv(paste0(datadir,'iCATS/iCATS_TS.csv'),header=T)
+icats_demo2 <- icats_demo2 %>% 
+  select(SID,TS_p_1,TS_p_2) %>%
+  rename(pbip_wave1 = TS_p_1,
+         pbip_wave2 = TS_p_2) 
+
+icats_demo <- icats_demo %>% left_join(.,icats_demo2) %>%
+  gather(variable,value,-SID,-gender) %>%
+  separate(variable,into=c("variable","wave")) %>% 
+  spread(variable,value) %>% 
+  mutate(pbip = as.ordered(pbip)) %>%
+  mutate(gender = factor(gender,levels=c(0,1),labels=c("Male","Female"))) %>%
+  mutate(id = paste0(SID,'_',wave)) %>%
+  filter(id %in% brain_wide$id)
+
+rm(icats_demo2)
+
+#check for missingness
+missDF <- icats_demo %>% select(-SID) 
+missTbl <- as.data.frame(sapply(missDF, function(x) sum(is.na(x)))) %>%
+  rownames_to_column() %>%
+  rename(variable = 1, n = 2) %>%
+  mutate(perc = 100*(round(n / nrow(missDF),2))) %>%
+  filter(variable %in% c("pbip_wave1","pbip_wave2"))
+MISSplot <- aggr(missDF, col=c('navyblue','red'), numbers=TRUE, labels=names(missDF), cex.axis=.4, gap=3, ylab=c("Histogram of missing data","Pattern"))
+
+#impute data
+impDF <- mice(icats_demo,m=30,maxit=30,
+              pred=quickpred(icats_demo,exclude= c('SID')),
+              seed=500)
+
+#create mean of imputed datasets to use in analyses
+completedData <- complete(impDF, 'long')
+agg <- aggregate(completedData[,c(6:8,10)] , by = list(completedData$.id),FUN= mean)
+agg2 <- aggregate(completedData[,c(5,9)] , by = list(completedData$.id),FUN= getmode)
+agg <- agg %>% left_join(.,agg2)
+ids <- completedData %>% filter(.imp==1) %>% select(.id,SID) %>% mutate(Group.1=.id) 
+aggDF <- agg %>% left_join(.,ids) %>% select(-Group.1,-.id)
+factors <- icats_demo %>% select(SID,gender)
+factors <- factors[!duplicated(factors$SID),]
+icats_imp <- aggDF %>% mutate(SID = as.character(SID)) %>% left_join(.,factors) 
+```
+
+###IMPORT NICAP DEMO & IMPUTE
+```{r}
+#import data and impute
+nicap_demo = read.csv(paste0(datadir,'puberty_long.csv'))
+nicap_demo <- nicap_demo %>% filter(controls==1) %>%
+  select(SID, gender, wave, age, pbip, pdss) %>%
+  mutate(SID = as.factor(SID)) %>%
+  gather(variable,value,-SID,-gender,-wave) %>%
+  mutate(variable = paste0(variable,'_',wave)) %>%
+  select(-wave) %>%
+  spread(variable,value) %>%
+  mutate(pbip_wave1 = ceiling(pbip_wave1),
+         pbip_wave2 = ceiling(pbip_wave2),
+         pbip_wave3 = ceiling(pbip_wave3)) %>%
+  gather(variable,value,-SID,-gender) %>%
+  separate(variable,into=c("variable","wave")) %>% 
+  spread(variable,value) %>%
+  mutate(gender = factor(gender,levels=c("Female","Male"),labels=c("Female","Male"))) %>%
+  mutate(pbip = as.ordered(pbip)) %>%
+  mutate(id = paste0(SID,'_',wave)) %>%
+  filter(id %in% brain_wide$id)
+
+#check for missingness
+missDF <- nicap_demo %>% select(-SID) 
+missTbl <- as.data.frame(sapply(missDF, function(x) sum(is.na(x)))) %>%
+  rownames_to_column() %>%
+  rename(variable = 1, n = 2) %>%
+  mutate(perc = 100*(round(n / nrow(missDF),2))) %>%
+  filter(variable %in% c("pbip_wave1","pbip_wave2"))
+MISSplot <- aggr(missDF, col=c('navyblue','red'), numbers=TRUE, labels=names(missDF), cex.axis=.4, gap=3, ylab=c("Histogram of missing data","Pattern"))
+
+#impute data
+impDF <- mice(nicap_demo,m=30,maxit=30,
+              pred=quickpred(nicap_demo,exclude= c('SID')),
+              seed=500)
+
+#create mean of imputed datasets to use in analyses
+completedData <- complete(impDF, 'long')
+agg <- aggregate(completedData[,c(6,8)] , by = list(completedData$.id),FUN= mean)
+agg2 <- aggregate(completedData[,c(5,7)] , by = list(completedData$.id),FUN= getmode)
+agg <- agg %>% left_join(.,agg2) 
+ids <- completedData %>% filter(.imp==1) %>% select(.id,SID) %>% mutate(Group.1=.id) 
+aggDF <- agg %>% left_join(.,ids) %>% select(-Group.1,-.id)
+factors <- nicap_demo %>% select(SID,gender)
+factors <- factors[!duplicated(factors$SID),]
+nicap_imp <- aggDF %>% left_join(.,factors) 
+```
+
+###UPDATE DEMO WITH IMPUTED DATA
+```{r}
+demo_imp <- icats_imp %>% select(SID, gender, wave, contains("age"), contains("pbip")) %>%
+  #gather(variable,value,-SID,-gender,-wave) %>%
+  mutate(study="iCATS", scanner = "pre")
+  
+demo_imp2 <- nicap_imp %>% select(SID, gender, wave, contains("age"), contains("pbip")) %>%
+  #gather(variable,value,-SID,-gender,-wave) %>%
+  mutate(study="NICAP", scanner = ifelse(wave=="wave3","post","pre"))  
+  
+demo_imp <- demo_imp %>% rbind(demo_imp2) %>%
+  mutate(id = paste0(SID,'_',wave)) %>%
+  arrange(SID)
+
+#add random slopes (pubertal tempo)
+raneff <- read.csv(paste0(outdir,'testREs_v4_newdata2020.csv'))
+raneff <- raneff %>% rename(SID = sid) %>%
+  mutate(ranAge = ifelse(gender==2,age_reM1cIrI,
+                         ifelse(gender==1,age_reFcIrI_onlyFixedLinear,NA))) %>%
+  mutate(ranInt = ifelse(gender==2,sid_reM1cIrI,
+                         ifelse(gender==1,sid_reFcIrI_onlyFixedLinear,NA))) %>%
+  mutate(SID = as.character(SID)) %>%
+  select(SID,ranAge,ranInt) %>%
+  arrange(SID) %>%
+  filter(!is.na(ranAge))
+
+raneff <- raneff[!duplicated(raneff$SID),]
+
+raneff_F <- raneff %>% left_join(.,demo) %>% filter(gender=="Female")
+cor.test(raneff_F$ranAge,raneff_F$ranInt)
+modF <- lm(ranAge ~ ranInt, raneff_F)
+raneff_F$resid <- resid(modF)
+raneff_F <- raneff_F %>% select(SID,resid)
+
+raneff_M <- raneff %>% left_join(.,demo) %>% filter(gender=="Male")
+cor.test(raneff_M$ranAge,raneff_M$ranInt)
+modM <- lm(ranAge ~ ranInt, raneff_M)
+raneff_M$resid <- resid(modM)
+raneff_M <- raneff_M %>% select(SID,resid)
+
+raneff2 <- rbind(raneff_F,raneff_M)
+
+raneff <- raneff %>% left_join(., raneff2)
+
+demo_imp <- demo_imp %>% left_join(.,raneff)
+#rm(demo_imp2,agg,aggDF,ids,completedData,impDF,factors,icats_imp,nicap_imp,MISSplot,missTbl,missDF,agg2)
+```
+
+###PLOTS
+```{r}
+#tempo plots
+demo_impF <- demo_imp %>% filter(gender=="Female" & !is.na(age) & !is.na(pbip) &!is.na(ranAge)) %>% 
+  mutate(pbip = as.numeric(as.character(pbip)))
+
+temp_plotF <- ggplot(demo_impF,aes(x=age,y=pbip)) + geom_line(aes(group=SID,colour=ranAge),alpha=0.6) + 
+  geom_point(aes(group=SID,colour=ranAge),alpha=0.6) +
+  geom_smooth(method ="lm",formula = y ~ poly(x,1),colour="black") +
+  scale_colour_gradientn(colors=plasma(7)) +
+  xlab("Age") + 
+  ylab("Tanner Stage") +
+  labs(colour = "Tempo") +
+  ylim(1,5)+
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.position="right")
+
+ggsave(filename=paste0(outdir,'plot_tempF.png'),plot=temp_plotF,width=6.5,height=5) 
+
+demo_impM <- demo_imp %>% filter(gender=="Male" & !is.na(age) & !is.na(pbip) & !is.na(ranAge)) %>% 
+  mutate(pbip = as.numeric(as.character(pbip)))
+
+temp_plotM <- ggplot(demo_impM,aes(x=age,y=pbip)) + geom_line(aes(group=SID,colour=ranAge),alpha=0.6) + 
+  geom_point(aes(group=SID,colour=ranAge),alpha=0.6) +
+  geom_smooth(method ="lm",formula = y ~ poly(x,2),colour="black") +
+  scale_colour_gradientn(colors=plasma(7)) +
+  xlab("Age") + 
+  ylab("Tanner Stage") +
+  labs(colour = "Tempo") +
+  ylim(1,5)+
+  theme_minimal(base_size = 24, base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        legend.position="right") 
+
+ggsave(filename=paste0(outdir,'plot_tempM.png'),plot=temp_plotM,width=6.5,height=5) 
+
+#data spread plot
+plotdf <- demo_imp %>%
+  arrange(age) %>%
+  mutate(SID = factor(SID, unique(SID)))
+
+plot_age <- ggplot(plotdf, aes(y=SID, x=age, group=SID, colour=gender))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Age") +
+  labs(colour = "Sex") +
+  scale_color_manual(values=c("#FF9900", "#9999FF"))+
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="none",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+
+plotdf <- demo_imp %>%
+  arrange(pbip) %>%
+  mutate(SID = factor(SID, unique(SID)))
+
+plot_puberty <- ggplot(plotdf, aes(y=SID, x=pbip, group=SID, colour=gender))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Tanner Stage") +
+  labs(colour = "Sex") +
+  scale_color_manual(values=c("#FF9900", "#9999FF"))+
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank())
+
+#sample plot X study
+plotdf <- demo_imp %>% 
+  arrange(age) %>%
+  mutate(SID = factor(SID, unique(SID)))  %>%
+  mutate(study = factor(study, levels=c("NICAP","iCATS")))
+
+plot_age_study <- ggplot(plotdf, aes(y=SID, x=age, group=SID, colour=study))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Age") +
+  labs(colour = "Study") +
+  scale_color_manual(values=c("#33CC66", "#3399FF"))+
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  facet_wrap(~gender)
+
+plotdf <- demo_imp %>%
+  arrange(pbip) %>%
+  mutate(SID = factor(SID, unique(SID))) %>%
+  mutate(study = factor(study, levels=c("NICAP","iCATS")))
+
+plot_puberty_study <- ggplot(plotdf, aes(y=SID, x=pbip, group=SID, colour=study))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Tanner Stage") +
+  labs(colour = "Study") +
+  scale_color_manual(values=c("#33CC66", "#3399FF"))+
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  facet_wrap(~gender)
+
+#sample plots X scanner
+plotdf <- demo_imp %>%
+  arrange(age) %>%
+  mutate(SID = factor(SID, unique(SID)))
+
+plot_age_scanner <- ggplot(plotdf, aes(y=SID, x=age, group=SID, colour=scanner))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Age") +
+  labs(colour = "Scanner") +
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  facet_wrap(~gender)
+
+plotdf <- demo_imp %>%
+  arrange(pbip) %>%
+  mutate(SID = factor(SID, unique(SID))) 
+
+plot_puberty_scanner <- ggplot(plotdf, aes(y=SID, x=pbip, group=SID, colour=scanner))+
+  geom_line(size=.6,alpha=0.6) + 
+  ylab("Participants") +
+  xlab("Tanner Stage") +
+  labs(colour = "Scanner") +
+  geom_point(size=2) +
+  theme_bw() +
+  theme_minimal(base_size = 18,
+                base_family = "Arial") +
+  theme(axis.line = element_line(colour = "black"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position="right",
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  facet_wrap(~gender)
+
+plot <- grid.arrange(plot_age,plot_puberty,ncol=2,nrow=1,widths=c(4.5,6),heights=5)
+ggsave(filename=paste0(outdir,'plot_age_puberty.png'),plot=plot,width=10,height=5) 
+ggsave(filename=paste0(outdir,'plot_age_study.png'),plot=plot_age_study,width=10,height=5) 
+ggsave(filename=paste0(outdir,'plot_puberty_study.png'),plot=plot_puberty_study,width=10,height=5) 
+ggsave(filename=paste0(outdir,'plot_age_scanner.png'),plot=plot_age_scanner,width=10,height=5) 
+ggsave(filename=paste0(outdir,'plot_puberty_scanner.png'),plot=plot_puberty_scanner,width=10,height=5) 
+```
+
+###SET UP FOR LOOPING
+```{r}
+#combine demo and brain
+data_wide <- demo_imp %>% right_join(., brain_wide)
+data_long <- demo_imp %>% right_join(., brain) %>% 
+  mutate(age_cov = age, pbip_cov = pbip) %>% gather(dev,dev_val,-SID,-gender,-wave,-study,-scanner,-id,-variable,-value,-age_cov,-pbip_cov,-ranInt)
+
+#regions to loop through
+reg <- c("thickness")
+regions <- grep(paste(reg, collapse="|"), colnames(data_wide), value=T)
+
+remove <- c("Left.non.WM.hypointensities","Right.non.WM.hypointensities","Left.WM.hypointensities","Right.WM.hypointensities","Left.choroid.plexus","Right.choroid.plexus","Left.vessel","Right.vessel","Left.Inf.Lat.Vent","Right.Inf.Lat.Vent","Left.Lateral.Ventricle","Right.Lateral.Ventricle","rh_MeanThickness_thickness","lh_MeanThickness_thickness","Left.Cerebellum.White.Matter","Left.Cerebellum.Cortex","Right.Cerebellum.White.Matter","Right.Cerebellum.Cortex","Left.VentralDC","Right.VentralDC")
+regions <- regions[!regions %in% remove]
+```
+
+###RUN AGE ANALYSES - Controlling SexStudyScanner
+```{r}
+index='age'
+covLab='SexStudyScanner'
+covariates='OFstudy + OFgender + OFscanner'
+
+models<-lapply(X=as.character(as.list(regions)), y=index,
+                             df=data_long, 
+                             FUN=function(roi_name, y, df) {
+
+  print(roi_name)
+  adf<-df %>% filter(variable==roi_name & dev==y) %>%
+    mutate(SID = as.factor(SID),
+           dev_val = as.numeric(dev_val),
+           gender = factor(gender, levels=c("Male","Female")))
+  adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+  
+  #ordered factoring of scanner
+  adf$OFscanner <- as.factor(adf$scanner)
+  # change factor to ordered factor:
+  adf$OFscanner <- as.ordered(adf$OFscanner)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFscanner) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFscanner)
+
+  #ordered factoring of gender
+  adf$OFgender <- factor(adf$gender,levels=c("Male","Female"))
+  # change factor to ordered factor:
+  adf$OFgender <- as.ordered(adf$OFgender)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFgender) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFgender)
+  
+  #ordered factoring of study
+  adf$OFstudy <- as.factor(adf$study)
+  # change factor to ordered factor:
+  adf$OFstudy <- as.ordered(adf$OFstudy)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFstudy) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFstudy)
+
+  #smooth and lin models
+  modN <- gam(as.formula(paste0('value ~ ', covariates,' + s(SID, bs="re")')), method = "ML", data=adf)
+  modL <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(SID, bs="re")')), method = "ML", data=adf)
+  modS <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #compare smooth and lin models
+  nulltest <- compareML(modN,modS)
+  nulltable <- nulltest$table
+  nulltable$AIC <- nulltest$AIC
+  nulltable$advice <- nulltest$advice
+  
+  #compare smooth and lin models
+  devtest <- compareML(modL,modS)
+  devtable <- devtest$table
+  devtable$AIC <- devtest$AIC
+  devtable$advice <- devtest$advice
+  
+  #save smooth model 
+  ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column()
+  stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column()
+  
+  #save lin model
+  ptable2 <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column()
+  stable2 <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() 
+  
+  #save lin model
+  ptable3 <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column()
+  stable3 <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column()
+  
+  #rate of change
+  change <- ptable2$Estimate[5]
+  perc <- 100*(change/mean(subset(adf,adf$wave=="wave1")$value))
+  
+  #plot trajectory
+  pred <- predict(modS,data=adf,exclude='s(SID)',se.fit=T)
+  adf$pred <- pred$fit
+  adf$se <- pred$se
+  adf$lower <- adf$pred - (1.96*(adf$se))
+  adf$upper <- adf$pred + (1.96*(adf$se))
+  
+  lab <- gsub("_thickness","",roi_name)
+  # plot <- ggplot() + 
+  #   geom_smooth(data=subset(adf,adf$gender=="Male" & adf$study=="iCATS"),aes(dev_val,pred)) +
+  #   geom_ribbon(data=subset(adf,adf$gender=="Male" & adf$study=="iCATS"),aes(x=dev_val,ymin=lower,ymax=upper),alpha=0.3)+
+  #   geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) + 
+  #   geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) +
+  #   theme_bw() +
+  #   ylab(lab) + 
+  #   xlab("Age") +
+  #   theme_minimal(base_size = 24, base_family = "Arial") +
+  #   theme(axis.line = element_line(colour = "black"),
+  #         panel.grid.major = element_blank(),
+  #         panel.grid.minor = element_blank(),
+  #         panel.border = element_blank(),
+  #         panel.background = element_blank(),
+  #         legend.position="none") 
+  # ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_',lab,'.png'),plot=plot,width=6,height=5)
+  
+  #combine all tables
+  table <- cbind.fill(nulltable,devtable,ptable,stable,ptable2,stable2,ptable3,stable3,perc,fill=NA)
+  table$roi <- roi_name
+  table$index <- y
+  table
+  })
+
+models_age <- rbindlist(models) 
+write.csv(models_age,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT.csv'),row.names=F)
+modelsFDR <- models_age[,c(24,28,50)]
+modelsFDR <- modelsFDR %>% filter(rowname=="s(dev_c)") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+modelsFDR <- modelsFDR %>% arrange(roi)
+write.csv(modelsFDR,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT_fdr.csv'),row.names=F)
+
+#create files for pysurfer
+DKT <- read.csv("/Volumes/rds/RDS27534-NICAP/code/sMRI/lmm/iCATS_NICAP/DKT.csv",header=F)
+perc <- data.frame(roi=models_age$roi,perc=models_age$object)
+perc <- perc %>% filter(!is.na(perc)) 
+lh_perc <- perc %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_perc <- perc %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+rh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+write.table(lh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+
+fdr <- data.frame(roi=modelsFDR$roi,fdr=modelsFDR$`p.fdr`)
+lh_fdr <- fdr %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_fdr <- fdr %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr)) 
+rh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+write.table(lh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+
+summary(perc$perc)
+sd(perc$perc)
+```
+
+###RUN AGE ANALYSES - Controlling SexStudyScanner_under13
+```{r}
+index='age'
+covLab='SexStudyScanner_under13'
+covariates='OFstudy + OFgender + OFscanner'
+
+models<-lapply(X=as.character(as.list(regions)), y=index,
+                             df=data_long, 
+                             FUN=function(roi_name, y, df) {
+
+  print(roi_name)
+  adf<-df %>% filter(variable==roi_name & dev==y) %>%
+    filter(age_cov < 13.0) %>%
+    mutate(SID = as.factor(SID),
+           dev_val = as.numeric(dev_val),
+           gender = factor(gender, levels=c("Male","Female")))
+  adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+  
+  #ordered factoring of scanner
+  adf$OFscanner <- as.factor(adf$scanner)
+  # change factor to ordered factor:
+  adf$OFscanner <- as.ordered(adf$OFscanner)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFscanner) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFscanner)
+
+  #ordered factoring of gender
+  adf$OFgender <- factor(adf$gender,levels=c("Male","Female"))
+  # change factor to ordered factor:
+  adf$OFgender <- as.ordered(adf$OFgender)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFgender) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFgender)
+  
+  #ordered factoring of study
+  adf$OFstudy <- as.factor(adf$study)
+  # change factor to ordered factor:
+  adf$OFstudy <- as.ordered(adf$OFstudy)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFstudy) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFstudy)
+
+  #smooth and lin models
+  modL <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(SID, bs="re")')), method = "ML", data=adf)
+  modS <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #compare smooth and lin models
+  devtest <- compareML(modL,modS)
+  devtable <- devtest$table
+  devtable$AIC <- devtest$AIC
+  devtable$advice <- devtest$advice
+  
+  #save smooth model 
+  ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column()
+  stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column()
+  
+  #save lin model
+  ptable2 <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column()
+  stable2 <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() 
+ 
+  #rate of change
+  change <- ptable2$Estimate[5]
+  perc <- 100*(change/mean(subset(adf,adf$wave=="wave1")$value))
+  
+  #plot trajectory
+  pred <- predict(modS,data=adf,exclude='s(SID)',se.fit=T)
+  adf$pred <- pred$fit
+  adf$se <- pred$se
+  adf$lower <- adf$pred - (1.96*(adf$se))
+  adf$upper <- adf$pred + (1.96*(adf$se))
+  
+  lab <- gsub("_thickness","",roi_name)
+  plot <- ggplot() + 
+    geom_smooth(data=subset(adf,adf$gender=="Male" & adf$study=="iCATS"),aes(dev_val,pred)) +
+    geom_ribbon(data=subset(adf,adf$gender=="Male" & adf$study=="iCATS"),aes(x=dev_val,ymin=lower,ymax=upper),alpha=0.3)+
+    geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) + 
+    geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) +
+    theme_bw() +
+    ylab(lab) + 
+    xlab("Age") +
+    theme_minimal(base_size = 24, base_family = "Arial") +
+    theme(axis.line = element_line(colour = "black"),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          legend.position="none") 
+  ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_',lab,'.png'),plot=plot,width=6,height=5)
+  
+  #combine all tables
+  table <- cbind.fill(devtable,ptable,stable,ptable2,stable2,perc,fill=NA)
+  table$roi <- roi_name
+  table$index <- y
+  table
+  })
+
+models_age <- rbindlist(models) 
+write.csv(models_age,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT.csv'),row.names=F)
+modelsFDR <- models_age[,c(15,19,31)]
+modelsFDR <- modelsFDR %>% filter(rowname=="s(dev_c)") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+modelsFDR <- modelsFDR %>% arrange(roi)
+write.csv(modelsFDR,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT_fdr.csv'),row.names=F)
+
+#create files for pysurfer
+DKT <- read.csv("/Volumes/rds/RDS27534-NICAP/code/sMRI/lmm/iCATS_NICAP/DKT.csv",header=F)
+perc <- data.frame(roi=models_age$roi,perc=models_age$object)
+perc <- perc %>% filter(!is.na(perc)) 
+lh_perc <- perc %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_perc <- perc %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+rh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+write.table(lh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+
+fdr <- data.frame(roi=modelsFDR$roi,fdr=modelsFDR$`p.fdr`)
+lh_fdr <- fdr %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_fdr <- fdr %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr)) 
+rh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+write.table(lh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+
+summary(perc$perc)
+sd(perc$perc)
+```
+
+###RUN PBIP ANALYSES (inc SEX INTERACTIONS)
+```{r}
+index='pbip'
+covLab='SexStudyScanner'
+covariates='OFgender + OFstudy + OFscanner'
+xlabel="TS"
+
+models<-lapply(X=as.character(as.list(regions)), y=index,
+                             df=data_long, 
+                             FUN=function(roi_name, y, df) {
+
+  print(roi_name)
+  adf<-df %>% filter(variable==roi_name & dev==y) %>%
+    mutate(SID = as.factor(SID),
+           dev_val = as.numeric(dev_val),
+           age_cov = as.numeric(age_cov),
+           gender = as.factor(gender)) 
+  adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+  adf$age_c = adf$age_cov - mean(adf$age,na.rm=T)
+  
+  #ordered factoring of scanner
+  adf$OFscanner <- as.factor(adf$scanner)
+  # change factor to ordered factor:
+  adf$OFscanner <- as.ordered(adf$OFscanner)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFscanner) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFscanner)
+
+  #ordered factoring of gender
+  adf$OFgender <- factor(adf$gender,levels=c("Male","Female"))
+  # change factor to ordered factor:
+  adf$OFgender <- as.ordered(adf$OFgender)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFgender) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFgender)
+  
+  #ordered factoring of study
+  adf$OFstudy <- as.factor(adf$study)
+  # change factor to ordered factor:
+  adf$OFstudy <- as.ordered(adf$OFstudy)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFstudy) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFstudy)
+  
+  #set params for extracting derivatives
+  mindev = 1
+  meandev = 3
+  maxdev = 5
+  
+  #null model (with age, sex, study, scanner)
+  modN <- gam(as.formula(paste0('value ~ ', covariates,' + s(SID, bs="re")')), method = "ML", data=adf)
+  
+  #smooth and lin models
+  modL <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(SID, bs="re")')), method = "ML", data=adf)
+  modS <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #save smooth model 
+  ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column()
+  stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column()
+
+  #save lin model
+  ptable2 <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column()
+  stable2 <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() 
+  
+  #save null model
+  ptable3 <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column()
+  stable3 <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column()   
+  
+  #rate of change
+  change <- ptable2$Estimate[5]
+  perc <- 100*(change/mean(subset(adf,adf$wave=="wave1")$value))
+  
+  #extract derivatives for smooth
+  sder <- derivatives(modS, term = "dev_c")
+  sder$dev <- sder$data + mean(adf$dev_val,na.rm=T)
+  minder <- mean(subset(sder,round(sder$dev,1)==mindev)$derivative)
+  meander <- mean(subset(sder,round(sder$dev,1)==meandev)$derivative)
+  maxder <- mean(subset(sder,round(sder$dev,1)==maxdev)$derivative)
+
+  #compare null and smooth models
+  nulltest <- compareML(modN,modS)
+  nulltable <- nulltest$table
+  nulltable$AIC <- nulltest$AIC
+  nulltable$advice <- nulltest$advice
+  
+  #compare smooth and lin models
+  devtest <- compareML(modL,modS)
+  devtable <- devtest$table
+  devtable$AIC <- devtest$AIC
+  devtable$advice <- devtest$advice
+  
+  #smooth dev * sex (with scanner and random intercept)
+  modSsex <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(dev_c, by=OFgender, bs="cs", k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+  modLsex <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + dev_c*OFgender + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #save smooth*sex model 
+  pSextable <- as.data.frame(summary(modSsex)$p.table) %>% rownames_to_column()
+  sSextable <- as.data.frame(summary(modSsex)$s.table) %>% rownames_to_column()
+
+  #save lin*sex model
+  pSextable2 <- as.data.frame(summary(modLsex)$p.table) %>% rownames_to_column()
+  sSextable2 <- as.data.frame(summary(modLsex)$s.table) %>% rownames_to_column()
+  
+  #extract derivatives for smooth
+  sSexder <- derivatives(modSsex,term="dev_c")
+  sSexder <- sSexder %>% select(smooth,derivative,data) %>% 
+    spread(smooth,derivative) %>% 
+    mutate(`s(dev_c):OFgenderFemale` = `s(dev_c)` + `s(dev_c):OFgenderFemale`) %>% 
+    gather(variable,value,-data) %>%
+    rename(derivative = value,
+           smooth = variable)
+  sSexder$dev <- sSexder$data + mean(adf$dev_val,na.rm=T)  
+  minderM <- mean(subset(sSexder,(round(sSexder$dev,1)==mindev) & (smooth=="s(dev_c)"))$derivative)
+  meanderM <- mean(subset(sSexder,(round(sSexder$dev,1)==meandev) & (smooth=="s(dev_c)"))$derivative)
+  maxderM <- mean(subset(sSexder,(round(sSexder$dev,1)==maxdev) & (smooth=="s(dev_c)"))$derivative)
+  minderF <- mean(subset(sSexder,(round(sSexder$dev,1)==mindev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  meanderF <-mean(subset(sSexder,(round(sSexder$dev,1)==meandev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  maxderF <- mean(subset(sSexder,(round(sSexder$dev,1)==maxdev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  
+  #compare smooth and smooth*sex
+  sextest <- compareML(modS,modSsex)
+  sextable <- sextest$table
+  sextable$AIC <- sextest$AIC
+  sextable$advice <- sextest$advice
+
+  #compare smooth*sex and lin*sex
+  sextest2 <- compareML(modSsex,modLsex)
+  sextable2 <- sextest2$table
+  sextable2$AIC <- sextest2$AIC
+  sextable2$advice <- sextest2$advice
+  
+  ##plot trajectory
+  # dev_c <- round(seq(min(adf$dev_c),max(adf$dev_c),by=1),1)
+  # plotdf <- data.frame(age_c=rep(0,5),dev_c=rep(dev_c,2),OFstudy="iCATS",OFgender="Male",OFscanner="pre",SID="1125C1")
+  # pred <- predict(modS,plotdf,exclude='s(SID)',se.fit=T)
+  # plotdf$pred <- pred$fit
+  # plotdf$se <- pred$se
+  # plotdf$lower <- plotdf$pred - (1.96*(plotdf$se))
+  # plotdf$upper <- plotdf$pred + (1.96*(plotdf$se))  
+  # plotdf$dev <- round(plotdf$dev_c + mean(adf$dev_val),1)
+  # lab <- gsub("_thickness","",roi_name)
+  # plot <- ggplot() + 
+  #   geom_smooth(data=subset(plotdf,plotdf$OFgender=="Male" & plotdf$OFstudy=="iCATS"),aes(dev,pred)) +
+  #   geom_ribbon(data=subset(plotdf,plotdf$OFgender=="Male" & plotdf$OFstudy=="iCATS"),aes(x=dev,ymin=lower,ymax=upper),alpha=0.3)+
+  #   geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) + 
+  #   geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) +
+  #   theme_bw() +
+  #   ylab(lab) + 
+  #   xlab(xlabel) +
+  #   theme_minimal(base_size = 24, base_family = "Arial") +
+  #   theme(axis.line = element_line(colour = "black"),
+  #         panel.grid.major = element_blank(),
+  #         panel.grid.minor = element_blank(),
+  #         panel.border = element_blank(),
+  #         panel.background = element_blank(),
+  #         legend.position="none") 
+  # ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_',lab,'.png'),plot=plot,width=6,height=5)
+  #
+  # #plot sex trajectory
+  # dev_c <- round(seq(min(adf$dev_c),max(adf$dev_c),by=1),1)
+  # plotdf <- data.frame(age_c=rep(0,5),dev_c=rep(dev_c,2),OFgender=c(rep("Male",5),rep("Female",5)),OFstudy="iCATS",OFscanner="pre",SID="1125C1")
+  # pred <- predict(modSsex,plotdf,exclude='s(SID)',se.fit=T)
+  # plotdf$pred <- pred$fit
+  # plotdf$se <- pred$se
+  # plotdf$lower <- plotdf$pred - (1.96*(plotdf$se))
+  # plotdf$upper <- plotdf$pred + (1.96*(plotdf$se))  
+  # plotdf$dev <- round(plotdf$dev_c + mean(adf$dev_val),1)
+  # plotdf <- plotdf %>% mutate(OFgender = factor(OFgender,levels=c("Male","Female")))
+  # lab <- gsub("_thickness","",roi_name)
+  # plot <- ggplot() + 
+  #   geom_smooth(data=plotdf,aes(dev,pred,group=OFgender,color=OFgender),method="gam",formula = y ~s(x,k=3)) +
+  #   geom_ribbon(data=plotdf,aes(x=dev,ymin=lower,ymax=upper,fill=OFgender),alpha=0.3)+
+  #   geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=OFgender),alpha=0.3) + 
+  #   geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=OFgender),alpha=0.3) +
+  #   scale_color_manual(values=c("#FF9900", "#9999FF"))+
+  #   scale_fill_manual(values=c("#FF9900", "#9999FF"))+
+  #   theme_bw() +
+  #   ylab(lab) + 
+  #   xlab(xlabel) +
+  #   theme_minimal(base_size = 24, base_family = "Arial") +
+  #   theme(axis.line = element_line(colour = "black"),
+  #         panel.grid.major = element_blank(),
+  #         panel.grid.minor = element_blank(),
+  #         panel.border = element_blank(),
+  #         panel.background = element_blank(),
+  #         legend.position="right",
+  #         legend.title=element_blank())
+  # ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_sex_',lab,'.png'),plot=plot,width=7.5,height=5)
+  
+  #combine all tables
+  ders=data.frame(minder=minder,minderM=minderM,minderF=minderF,meander=meander,meanderM=meanderM,meanderF=meanderF,maxder=maxder,maxderM=maxderM,maxderF=maxderF)
+  table <- cbind.fill(ptable,stable,ptable2,stable2,ptable3,stable3,nulltable,devtable,pSextable,sSextable,pSextable2,sSextable2,sextable,sextable2,ders,perc,fill=NA)
+  table$roi <- roi_name
+  table$index <- y
+  table
+  } )
+
+models_pbip <- rbindlist(models) 
+write.csv(models_pbip,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT.csv'),row.names=F)
+modelsFDR <- models_pbip[,c(6,10,97)]
+modelsFDR <- modelsFDR %>% filter(rowname=="s(dev_c)") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+modelsFDR <- modelsFDR %>% arrange(roi)
+write.csv(modelsFDR,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT_fdr.csv'),row.names=F)
+
+#create files for pysurfer
+DKT <- read.csv("/Volumes/rds/RDS27534-NICAP/code/sMRI/lmm/iCATS_NICAP/DKT.csv",header=F)
+perc <- data.frame(roi=models_pbip$roi,perc=models_pbip$object)
+perc <- perc %>% filter(!is.na(perc)) 
+lh_perc <- perc %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_perc <- perc %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+rh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+write.table(lh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+
+fdr <- data.frame(roi=modelsFDR$roi,fdr=modelsFDR$`p.fdr`)
+lh_fdr <- fdr %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_fdr <- fdr %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+rh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+write.table(lh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+
+summary(perc$perc)
+sd(perc$perc)
+```
+
+###RUN PBIP ANALYSES (inc SEX INTERACTIONS), CONTROLLING AGE
+```{r}
+index='pbip'
+covLab='AgeSexStudyScanner'
+covariates='OFgender + OFstudy + OFscanner + s(age_c, k=3, bs="cs")'
+xlabel="TS"
+
+models<-lapply(X=as.character(as.list(regions)), y=index,
+                             df=data_long, 
+                             FUN=function(roi_name, y, df) {
+
+  print(roi_name)
+  adf<-df %>% filter(variable==roi_name & dev==y) %>%
+    mutate(SID = as.factor(SID),
+           dev_val = as.numeric(dev_val),
+           age_cov = as.numeric(age_cov),
+           gender = as.factor(gender)) 
+  adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+  adf$age_c = adf$age_cov - mean(adf$age,na.rm=T)
+  
+  #ordered factoring of scanner
+  adf$OFscanner <- as.factor(adf$scanner)
+  # change factor to ordered factor:
+  adf$OFscanner <- as.ordered(adf$OFscanner)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFscanner) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFscanner)
+
+  #ordered factoring of gender
+  adf$OFgender <- factor(adf$gender,levels=c("Male","Female"))
+  # change factor to ordered factor:
+  adf$OFgender <- as.ordered(adf$OFgender)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFgender) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFgender)
+  
+  #ordered factoring of study
+  adf$OFstudy <- as.factor(adf$study)
+  # change factor to ordered factor:
+  adf$OFstudy <- as.ordered(adf$OFstudy)
+  # change contrast to treatment coding (difference curves)
+  contrasts(adf$OFstudy) <- 'contr.treatment'
+  # Inspect contrasts:
+  contrasts(adf$OFstudy)
+  
+  #set params for extracting derivatives
+  mindev = 1
+  meandev = 3
+  maxdev = 5
+  
+  #null model (with age, sex, study, scanner)
+  modN <- gam(as.formula(paste0('value ~ ', covariates,' + s(SID, bs="re")')), method = "ML", data=adf)
+  
+  #smooth and lin models
+  modL <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(SID, bs="re")')), method = "ML", data=adf)
+  modS <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #save smooth model 
+  ptable <- as.data.frame(summary(modS)$p.table) %>% rownames_to_column()
+  stable <- as.data.frame(summary(modS)$s.table) %>% rownames_to_column()
+
+  #save lin model
+  ptable2 <- as.data.frame(summary(modL)$p.table) %>% rownames_to_column()
+  stable2 <- as.data.frame(summary(modL)$s.table) %>% rownames_to_column() 
+  
+  #save null model
+  ptable3 <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column()
+  stable3 <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column() 
+  
+  #rate of change
+  change <- ptable2$Estimate[5]
+  perc <- 100*(change/mean(subset(adf,adf$wave=="wave1")$value))
+  
+  #extract derivatives for smooth
+  sder <- derivatives(modS, term = "dev_c")
+  sder$dev <- sder$data + mean(adf$dev_val,na.rm=T)
+  minder <- mean(subset(sder,round(sder$dev,1)==mindev)$derivative)
+  meander <- mean(subset(sder,round(sder$dev,1)==meandev)$derivative)
+  maxder <- mean(subset(sder,round(sder$dev,1)==maxdev)$derivative)
+
+  #compare null and smooth models
+  nulltest <- compareML(modN,modS)
+  nulltable <- nulltest$table
+  nulltable$AIC <- nulltest$AIC
+  nulltable$advice <- nulltest$advice
+  
+  #compare smooth and lin models
+  devtest <- compareML(modL,modS)
+  devtable <- devtest$table
+  devtable$AIC <- devtest$AIC
+  devtable$advice <- devtest$advice
+  
+  #smooth dev * sex (with scanner and random intercept)
+  modSsex <- gam(as.formula(paste0('value ~ ', covariates,' + s(dev_c, bs="cs",k=3) + s(dev_c, by=OFgender, bs="cs", k=3) + s(SID, bs="re")')), method = "ML", data=adf)
+  modLsex <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + dev_c*OFgender + s(SID, bs="re")')), method = "ML", data=adf)
+
+  #save smooth*sex model 
+  pSextable <- as.data.frame(summary(modSsex)$p.table) %>% rownames_to_column()
+  sSextable <- as.data.frame(summary(modSsex)$s.table) %>% rownames_to_column()
+  
+  #save lin*sex model
+  pSextable2 <- as.data.frame(summary(modLsex)$p.table) %>% rownames_to_column()
+  sSextable2 <- as.data.frame(summary(modLsex)$s.table) %>% rownames_to_column()
+  
+  #extract derivatives for smooth
+  sSexder <- derivatives(modSsex,term="dev_c")
+  sSexder <- sSexder %>% select(smooth,derivative,data) %>% 
+    spread(smooth,derivative) %>% 
+    mutate(`s(dev_c):OFgenderFemale` = `s(dev_c)` + `s(dev_c):OFgenderFemale`) %>% 
+    gather(variable,value,-data) %>%
+    rename(derivative = value,
+           smooth = variable)
+  sSexder$dev <- sSexder$data + mean(adf$dev_val,na.rm=T)  
+  minderM <- mean(subset(sSexder,(round(sSexder$dev,1)==mindev) & (smooth=="s(dev_c)"))$derivative)
+  meanderM <- mean(subset(sSexder,(round(sSexder$dev,1)==meandev) & (smooth=="s(dev_c)"))$derivative)
+  maxderM <- mean(subset(sSexder,(round(sSexder$dev,1)==maxdev) & (smooth=="s(dev_c)"))$derivative)
+  minderF <- mean(subset(sSexder,(round(sSexder$dev,1)==mindev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  meanderF <-mean(subset(sSexder,(round(sSexder$dev,1)==meandev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  maxderF <- mean(subset(sSexder,(round(sSexder$dev,1)==maxdev) & (smooth=="s(dev_c):OFgenderFemale"))$derivative)
+  
+  #compare smooth and smooth*sex
+  sextest <- compareML(modS,modSsex)
+  sextable <- sextest$table
+  sextable$AIC <- sextest$AIC
+  sextable$advice <- sextest$advice
+
+  #compare smooth*sex and lin*sex
+  sextest2 <- compareML(modSsex,modLsex)
+  sextable2 <- sextest2$table
+  sextable2$AIC <- sextest2$AIC
+  sextable2$advice <- sextest2$advice
+  
+  # #plot trajectory
+  # dev_c <- round(seq(min(adf$dev_c),max(adf$dev_c),by=1),1)
+  # plotdf <- data.frame(age_c=rep(0,5),dev_c=rep(dev_c,2),OFstudy="iCATS",OFgender="Male",OFscanner="pre",SID="1125C1")
+  # pred <- predict(modS,plotdf,exclude='s(SID)',se.fit=T)
+  # plotdf$pred <- pred$fit
+  # plotdf$se <- pred$se
+  # plotdf$lower <- plotdf$pred - (1.96*(plotdf$se))
+  # plotdf$upper <- plotdf$pred + (1.96*(plotdf$se))  
+  # plotdf$dev <- round(plotdf$dev_c + mean(adf$dev_val),1)
+  # lab <- gsub("_thickness","",roi_name)
+  # plot <- ggplot() + 
+  #   geom_smooth(data=subset(plotdf,plotdf$OFgender=="Male" & plotdf$OFstudy=="iCATS"),aes(dev,pred)) +
+  #   geom_ribbon(data=subset(plotdf,plotdf$OFgender=="Male" & plotdf$OFstudy=="iCATS"),aes(x=dev,ymin=lower,ymax=upper),alpha=0.3)+
+  #   geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) + 
+  #   geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=SID),alpha=0.3) +
+  #   theme_bw() +
+  #   ylab(lab) + 
+  #   xlab(xlabel) +
+  #   theme_minimal(base_size = 24, base_family = "Arial") +
+  #   theme(axis.line = element_line(colour = "black"),
+  #         panel.grid.major = element_blank(),
+  #         panel.grid.minor = element_blank(),
+  #         panel.border = element_blank(),
+  #         panel.background = element_blank(),
+  #         legend.position="none") 
+  # ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_',lab,'.png'),plot=plot,width=6,height=5)
+  # 
+  # #plot sex trajectory
+  # dev_c <- round(seq(min(adf$dev_c),max(adf$dev_c),by=1),1)
+  # plotdf <- data.frame(age_c=rep(0,5),dev_c=rep(dev_c,2),OFgender=c(rep("Male",5),rep("Female",5)),OFstudy="iCATS",OFscanner="pre",SID="1125C1")
+  # pred <- predict(modSsex,plotdf,exclude='s(SID)',se.fit=T)
+  # plotdf$pred <- pred$fit
+  # plotdf$se <- pred$se
+  # plotdf$lower <- plotdf$pred - (1.96*(plotdf$se))
+  # plotdf$upper <- plotdf$pred + (1.96*(plotdf$se)) 
+  # plotdf$dev <- round(plotdf$dev_c + mean(adf$dev_val),1)
+  # lab <- gsub("_thickness","",roi_name)
+  # plotdf <- plotdf %>% mutate(OFgender = factor(OFgender,levels=c("Male","Female")))
+  # plot <- ggplot() + 
+  #   geom_smooth(data=plotdf,aes(dev,pred,group=OFgender,color=OFgender),method="gam",formula = y ~s(x,k=3)) +
+  #   geom_ribbon(data=plotdf,aes(x=dev,ymin=lower,ymax=upper,fill=OFgender),alpha=0.3)+
+  #   geom_point(data=adf,aes(x=dev_val,y=value,group=SID,colour=OFgender),alpha=0.3) + 
+  #   geom_line(data=adf,aes(x=dev_val,y=value,group=SID,colour=OFgender),alpha=0.3) +
+  #   scale_color_manual(values=c("#FF9900", "#9999FF"))+
+  #   scale_fill_manual(values=c("#FF9900", "#9999FF"))+   
+  #   theme_bw() +
+  #   ylab(lab) + 
+  #   xlab(xlabel) +
+  #   theme_minimal(base_size = 24, base_family = "Arial") +
+  #   theme(axis.line = element_line(colour = "black"),
+  #         panel.grid.major = element_blank(),
+  #         panel.grid.minor = element_blank(),
+  #         panel.border = element_blank(),
+  #         panel.background = element_blank(),
+  #         legend.position="right",
+  #         legend.title=element_blank())
+  # ggsave(filename=paste0(outdir,y,'/cont',covLab,'/',y,'_sex_',lab,'.png'),plot=plot,width=7.5,height=5)
+  
+  #combine all tables
+  ders=data.frame(minder=minder,minderM=minderM,minderF=minderF,meander=meander,meanderM=meanderM,meanderF=meanderF,maxder=maxder,maxderM=maxderM,maxderF=maxderF)
+  table <- cbind.fill(ptable,stable,ptable2,stable2,ptable3,stable3,nulltable,devtable,pSextable,sSextable,pSextable2,sSextable2,sextable,sextable2,ders,perc,fill=NA)
+
+table$roi <- roi_name
+  table$index <- y
+  table
+  } )
+
+models_pbip_age <- rbindlist(models) 
+write.csv(models_pbip_age,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT.csv'),row.names=F)
+modelsFDR <- models_pbip_age[,c(6,10,97)]
+modelsFDR <- modelsFDR %>% filter(rowname=="s(dev_c)") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+modelsFDR <- modelsFDR %>% arrange(roi)
+write.csv(modelsFDR,file=paste0(outdir,index,'/cont',covLab,'/',index,'_DKT_fdr.csv'),row.names=F)
+
+#create files for pysurfer
+DKT <- read.csv("/Volumes/rds/RDS27534-NICAP/code/sMRI/lmm/iCATS_NICAP/DKT.csv",header=F)
+perc <- data.frame(roi=models_pbip_age$roi,perc=models_pbip_age$object)
+perc <- perc %>% filter(!is.na(perc)) 
+lh_perc <- perc %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_perc <- perc %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+rh_perc <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_perc) %>% select(perc) %>% mutate(perc = ifelse(is.na(perc),-999,perc))
+write.table(lh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_perc,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_perc_DKT.csv'),row.names=F,col.names=FALSE)
+
+fdr <- data.frame(roi=modelsFDR$roi,fdr=modelsFDR$`p.fdr`)
+lh_fdr <- fdr %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_fdr <- fdr %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+rh_fdr <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_fdr) %>% select(fdr) %>% mutate(fdr = ifelse(is.na(fdr),-999,fdr))
+write.table(lh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_fdr,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_fdr_DKT.csv'),row.names=F,col.names=FALSE)
+
+modelfit <- models_pbip_age[,c(21,26,77)]
+modelfit <- modelfit %>% filter(!is.na(p.value)) %>% filter(!p.value=="")
+lh_modelfit <- modelfit %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+rh_modelfit <- modelfit %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+lh_modelfit <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_modelfit) %>% select(p.value) %>% mutate(p.value = as.numeric(as.character(p.value))) %>%mutate(p.value = ifelse(is.na(p.value),-999,p.value))
+rh_modelfit <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_modelfit) %>% select(p.value) %>% mutate(p.value = as.numeric(as.character(p.value))) %>%mutate(p.value = ifelse(is.na(p.value),-999,p.value))
+write.table(lh_modelfit,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_lh_modelfit_DKT.csv'),row.names=F,col.names=FALSE)
+write.table(rh_modelfit,paste0(outdir,index,'/cont',covLab,'/plot_',index,'_rh_modelfit_DKT.csv'),row.names=F,col.names=FALSE)
+
+summary(perc$perc)
+sd(perc$perc)
+```
+
+###RUN TEMPO * AGE WITHIN EACH SEX
+```{r}
+index='ranAge'
+covLab='AgeStudyScanner'
+covariates='OFstudy + OFscanner'
+xlabel="Age"
+
+for (gen in c("Male","Female")) {
+  models<-lapply(X=as.character(as.list(regions)), y=index, g=gen,
+                               df=data_long, 
+                               FUN=function(roi_name, y, g, df) {
+  
+    print(roi_name)
+      adf<-df %>% filter(variable==roi_name & dev==y & gender==g) %>%
+        filter(!is.na(dev_val)) %>%
+        mutate(SID = as.factor(SID),
+             dev_val = as.numeric(dev_val),
+             age_cov = as.numeric(age_cov)) 
+      adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+      adf$age_c = adf$age_cov - mean(adf$age,na.rm=T)   
+      
+      #ordered factoring of scanner
+      adf$OFscanner <- as.factor(adf$scanner)
+      # change factor to ordered factor:
+      adf$OFscanner <- as.ordered(adf$OFscanner)
+      # change contrast to treatment coding (difference curves)
+      contrasts(adf$OFscanner) <- 'contr.treatment'
+      # Inspect contrasts:
+      contrasts(adf$OFscanner)
+      
+      #ordered factoring of study
+      adf$OFstudy <- as.factor(adf$study)
+      # change factor to ordered factor:
+      adf$OFstudy <- as.ordered(adf$OFstudy)
+      # change contrast to treatment coding (difference curves)
+      contrasts(adf$OFstudy) <- 'contr.treatment'
+      # Inspect contrasts:
+      contrasts(adf$OFstudy) 
+      
+      #set params to extract derivatives
+      mindev = round(min(adf$dev_val,na.rm=T),1)
+      meandev = round(mean(adf$dev_val,na.rm=T),1)
+      maxdev = round(max(adf$dev_val,na.rm=T),1)
+      
+      #null model (with age, study, scanner)
+      modN <- gam(as.formula(paste0('value ~ ', covariates,' + s(age_c, k=3, bs="cs") + s(SID, bs="re")')), method = "ML", data=adf)
+      modM <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(age_c, k=3, bs="cs") + s(SID, bs="re")')), method = "ML", data=adf)
+      modI <- gam(as.formula(paste0('value ~ ', covariates,' + dev_c + s(age_c, k=3, bs="cs") + s(age_c, by=dev_c, k=3, bs="cs") + s(SID, bs="re")')), method = "ML", data=adf)
+
+      #save interaction model 
+      ptable <- as.data.frame(summary(modI)$p.table) %>% rownames_to_column()
+      stable <- as.data.frame(summary(modI)$s.table) %>% rownames_to_column()
+
+      #save main model 
+      ptable2 <- as.data.frame(summary(modM)$p.table) %>% rownames_to_column()
+      stable2 <- as.data.frame(summary(modM)$s.table) %>% rownames_to_column()
+      
+      #save null model 
+      ptable3 <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column()
+      stable3 <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column()
+      
+      # #extract derivatives for smooth
+      # sder <- derivatives(modS, term = "dev_c")
+      # sder$dev <- sder$data + mean(adf$dev_val,na.rm=T)
+      # minder <- mean(subset(sder,round(sder$dev,1)==mindev)$derivative,na.rm=T)
+      # meander <- mean(subset(sder,round(sder$dev,1)==meandev)$derivative,na.rm=T)
+      # maxder <- mean(subset(sder,round(sder$dev,1)==maxdev)$derivative,na.rm=T)
+    
+      #compare null and smooth models
+      nulltest <- compareML(modN,modI)
+      nulltable <- nulltest$table
+      nulltable$AIC <- nulltest$AIC
+      nulltable$advice <- nulltest$advice
+      
+      devtest <- compareML(modM,modI)
+      devtable <- devtest$table
+      devtable$AIC <- devtest$AIC
+      devtable$advice <- devtest$advice
+      
+      #plot trajectory
+      age_c <- round(seq(min(adf$age_c),max(adf$age_c),by=1),1)
+      mean_dev <- rep(mean(adf$dev_c),length(age_c))
+      min_dev1 <- rep(mean(adf$dev_c) - sd(adf$dev_c),length(age_c))
+      max_dev1 <- rep(mean(adf$dev_c) + sd(adf$dev_c),length(age_c))
+      min_dev2 <- rep(mean(adf$dev_c) - 2*(sd(adf$dev_c)),length(age_c))
+      max_dev2 <- rep(mean(adf$dev_c) + 2*(sd(adf$dev_c)),length(age_c))
+      
+      # if (g == "Female") {
+      #   SID = "1025C1"
+      #   } else (SID = "1125C1")
+      # 
+      # plotdf <- data.frame(age_c=rep(age_c,5),dev_c=c(min_dev2,min_dev1,mean_dev,max_dev1,max_dev2),OFstudy="iCATS",OFscanner="pre",SID=SID)
+      # pred <- predict(modI,plotdf,exclude='s(SID)')
+      # plotdf$pred <- pred
+      # plotdf$age <- round(plotdf$age_c + mean(adf$age_cov),1)
+      # plotdf$tempo <- as.factor(round(plotdf$dev_c,2))
+      # lab <- gsub("_thickness","",roi_name)
+      # plot <- ggplot() +
+      #   geom_smooth(data=plotdf,aes(age,pred,group=tempo,colour=tempo),method="auto",span = 0.8) +
+      #   theme_bw() +
+      #   ylab(lab) +
+      #   xlab(xlabel) +
+      #   ylim(2.7,3.3) +
+      #   theme_minimal(base_size = 24, base_family = "Arial") +
+      #   theme(axis.line = element_line(colour = "black"),
+      #         panel.grid.major = element_blank(),
+      #         panel.grid.minor = element_blank(),
+      #         panel.border = element_blank(),
+      #         panel.background = element_blank())
+      # ggsave(filename=paste0(outdir,'tempo/cont',covLab,'/tempo_',g,'_',lab,'.png'),plot=plot,width=7,height=5)
+
+      #combine all tables
+      #ders=data.frame(minder=minder,meander=meander,maxder=maxder)
+      table <- cbind.fill(ptable,stable,ptable2,stable2,ptable3,stable3,nulltable,devtable,fill=NA)
+      table$roi <- roi_name
+      table$index <- y
+      table$gender <- g
+      table
+      })
+  
+  models_tempo <- rbindlist(models) 
+  write.csv(models_tempo,file=paste0(outdir,'tempo/cont',covLab,'/tempo_',gen,'_DKT.csv'),row.names=F)
+  modelsFDR <- models_tempo[,c(6,10,49)]
+  modelsFDR <- modelsFDR %>% filter(rowname=="s(age_c):dev_c") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+  modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+  modelsFDR <- modelsFDR %>% arrange(p.fdr)
+  write.csv(modelsFDR,file=paste0(outdir,'tempo/cont',covLab,'/tempo_',gen,'_DKT_fdr.csv'),row.names=F) 
+  
+  modelfit <- models_tempo[,c(31,36,49)]
+  modelfit <- modelfit %>% filter(!is.na(p.value)) %>% filter(!p.value=="")
+  lh_modelfit <- modelfit %>% filter(grepl("lh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("lh_","",roi))
+  rh_modelfit <- modelfit %>% filter(grepl("rh_",roi)) %>% mutate(roi = gsub("_thickness","",roi)) %>% mutate(roi = gsub("rh_","",roi)) 
+  
+   #manually changing parahippo (interaction is not better than main effect)
+  rh_modelfit <- rh_modelfit %>% mutate(p.value = ifelse(roi=="parahippocampal",0.06,p.value))
+                                                                                                                                                                
+  lh_modelfit <- DKT %>% mutate(roi = V1) %>% left_join(.,lh_modelfit) %>% select(p.value) %>% mutate(p.value = as.numeric(as.character(p.value))) %>% mutate(p.value = ifelse(is.na(p.value),-999,p.value))
+  rh_modelfit <- DKT %>% mutate(roi = V1) %>% left_join(.,rh_modelfit) %>% select(p.value) %>% mutate(p.value = as.numeric(as.character(p.value))) %>% mutate(p.value = ifelse(is.na(p.value),-999,p.value))
+  write.table(lh_modelfit,paste0(outdir,'tempo/cont',covLab,'/plot_tempo_lh_modelfit_DKT.csv'),row.names=F,col.names=FALSE)
+  write.table(rh_modelfit,paste0(outdir,'tempo/cont',covLab,'/plot_tempo_rh_modelfit_DKT.csv'),row.names=F,col.names=FALSE) }
+```
+
+###RUN TEMPO * AGE WITHIN EACH SEX (controlling ranInt)
+```{r}
+index='ranAge'
+covLab='AgeInterceptStudyScanner'
+covariates='OFstudy + OFscanner'
+xlabel="Age"
+
+for (gen in c("Male","Female")) {
+  models<-lapply(X=as.character(as.list(regions)), y=index, g=gen,
+                               df=data_long, 
+                               FUN=function(roi_name, y, g, df) {
+  
+    print(roi_name)
+      adf<-df %>% filter(variable==roi_name & dev==y & gender==g) %>%
+        filter(!is.na(dev_val)) %>%
+        mutate(SID = as.factor(SID),
+             dev_val = as.numeric(dev_val),
+             age_cov = as.numeric(age_cov),
+             int_cov = as.numeric(ranInt)) 
+      adf$dev_c = adf$dev_val - mean(adf$dev_val,na.rm=T)
+      adf$int_c = adf$int_cov - mean(adf$ranInt,na.rm=T)   
+      adf$age_c = adf$age_cov - mean(adf$age,na.rm=T)   
+      
+      #ordered factoring of scanner
+      adf$OFscanner <- as.factor(adf$scanner)
+      # change factor to ordered factor:
+      adf$OFscanner <- as.ordered(adf$OFscanner)
+      # change contrast to treatment coding (difference curves)
+      contrasts(adf$OFscanner) <- 'contr.treatment'
+      # Inspect contrasts:
+      contrasts(adf$OFscanner)
+      
+      #ordered factoring of study
+      adf$OFstudy <- as.factor(adf$study)
+      # change factor to ordered factor:
+      adf$OFstudy <- as.ordered(adf$OFstudy)
+      # change contrast to treatment coding (difference curves)
+      contrasts(adf$OFstudy) <- 'contr.treatment'
+      # Inspect contrasts:
+      contrasts(adf$OFstudy) 
+      
+      #set params to extract derivatives
+      mindev = round(min(adf$dev_val,na.rm=T),1)
+      meandev = round(mean(adf$dev_val,na.rm=T),1)
+      maxdev = round(max(adf$dev_val,na.rm=T),1)
+      
+      #null model: study, scanner, intercept, age, age*intercept 
+      modN <- gam(as.formula(paste0('value ~ ', covariates,' + s(age_c, k=3, bs="cs") + int_c + s(age_c, by=int_c, k=3, bs="cs") + s(SID, bs="re")')), method = "ML", data=adf)
+      #main model: study, scanner, intercept, age, age*intercept, slope 
+      modM <- gam(as.formula(paste0('value ~ ', covariates,' + s(age_c, k=3, bs="cs") + int_c + s(age_c, by=int_c, k=3, bs="cs") + s(SID, bs="re") + dev_c ')), method = "ML", data=adf)
+      #interaction model: study, scanner, intercept, age, age*intercept, slope, age*slope 
+      modI <- gam(as.formula(paste0('value ~ ', covariates,' + s(age_c, k=3, bs="cs") + int_c + s(age_c, by=int_c, k=3, bs="cs") + s(SID, bs="re") + dev_c + s(age_c, by=dev_c, k=3, bs="cs")')), method = "ML", data=adf)
+
+      #save interaction model 
+      ptable <- as.data.frame(summary(modI)$p.table) %>% rownames_to_column()
+      stable <- as.data.frame(summary(modI)$s.table) %>% rownames_to_column()
+
+      #save interaction model 
+      ptable2 <- as.data.frame(summary(modM)$p.table) %>% rownames_to_column()
+      stable2 <- as.data.frame(summary(modM)$s.table) %>% rownames_to_column()
+      
+      #save interaction model 
+      ptable3 <- as.data.frame(summary(modN)$p.table) %>% rownames_to_column()
+      stable3 <- as.data.frame(summary(modN)$s.table) %>% rownames_to_column()
+      
+      # #extract derivatives for smooth
+      # sder <- derivatives(modS, term = "dev_c")
+      # sder$dev <- sder$data + mean(adf$dev_val,na.rm=T)
+      # minder <- mean(subset(sder,round(sder$dev,1)==mindev)$derivative,na.rm=T)
+      # meander <- mean(subset(sder,round(sder$dev,1)==meandev)$derivative,na.rm=T)
+      # maxder <- mean(subset(sder,round(sder$dev,1)==maxdev)$derivative,na.rm=T)
+    
+      #compare null and smooth models
+      nulltest <- compareML(modN,modI)
+      nulltable <- nulltest$table
+      nulltable$AIC <- nulltest$AIC
+      nulltable$advice <- nulltest$advice
+      
+      devtest <- compareML(modM,modI)
+      devtable <- devtest$table
+      devtable$AIC <- devtest$AIC
+      devtable$advice <- devtest$advice
+      
+      #combine all tables
+      #ders=data.frame(minder=minder,meander=meander,maxder=maxder)
+      table <- cbind.fill(ptable,stable,ptable2,stable2,ptable3,stable3,nulltable,devtable,fill=NA)
+      table$roi <- roi_name
+      table$index <- y
+      table$gender <- g
+      table
+      })
+  
+  models_tempo <- rbindlist(models) 
+  write.csv(models_tempo,file=paste0(outdir,'tempo/cont',covLab,'/tempo_',gen,'_DKT.csv'),row.names=F)
+  modelsFDR <- models_tempo[,c(6,10,49)]
+  modelsFDR <- modelsFDR %>% filter(rowname=="s(age_c):dev_c") %>% mutate(`p.value`=as.numeric(as.character(`p.value`)))
+  modelsFDR$p.fdr <- p.adjust(modelsFDR$`p.value`,method="fdr") 
+  modelsFDR <- modelsFDR %>% arrange(p.fdr)
+  write.csv(modelsFDR,file=paste0(outdir,'tempo/cont',covLab,'/tempo_',gen,'_DKT_fdr.csv'),row.names=F) }
+```
